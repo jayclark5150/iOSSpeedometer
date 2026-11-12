@@ -1,5 +1,5 @@
 //
-//  SpeedometerApp.swift  (v4 — History)
+//  SpeedometerApp.swift  (v5 — Reliability)
 //  GPS speedometer / trip computer that saves history and Apple Health workouts.
 //
 //  Xcode setup required:
@@ -110,8 +110,12 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     // Auto start — resets to off each launch
     @Published var autoStart: Bool = false
-    @Published var autoEndRequested: Bool = false
     var isArmed: Bool { autoStart && !isTracking }
+
+    // Side effects injected by the app layer so a finished trip is handled
+    // regardless of which tab is on screen (SwiftData insert / HealthKit save).
+    var persistRecord: ((TripRecord) -> Void)?
+    var autoSaveHealth: (() -> Void)?
 
     private let manager = CLLocationManager()
     private var lastLocation: CLLocation? = nil
@@ -134,6 +138,16 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
     private var autoStopDelay: TimeInterval {
         activity == .drive ? 30 : 15
+    }
+
+    // Fastest believable travel speed between two fixes (m/s).
+    // Anything faster is treated as a GPS jump, not real movement.
+    private var maxPlausibleSpeed: Double {
+        switch activity {
+        case .drive: return 90    // ~200 mph
+        case .bike:  return 30    // ~67 mph
+        case .walk:  return 12    // ~27 mph
+        }
     }
 
     var routeCoordinates: [CLLocationCoordinate2D] {
@@ -181,7 +195,6 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     func resetTrip() {
         cancelAutoStop()
-        autoEndRequested = false
         pauseTrip()
         tripDistanceMeters = 0
         maxSpeedMetersPerSecond = 0
@@ -195,6 +208,32 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     var elapsed: TimeInterval {
         accumulatedTime + (tripStart.map { Date().timeIntervalSince($0) } ?? 0)
+    }
+
+    /// Snapshots the current trip into a persistable record, or nil if there's
+    /// nothing worth keeping.
+    func makeRecord() -> TripRecord? {
+        guard hasHistoryToSave else { return nil }
+        return TripRecord(
+            date: sessionStart ?? Date(),
+            activity: activity,
+            distanceMeters: tripDistanceMeters,
+            durationSeconds: elapsed,
+            maxSpeedMPS: maxSpeedMetersPerSecond,
+            locations: routeLocations
+        )
+    }
+
+    /// Called when auto-stop fires. Saves to history, auto-saves fitness trips
+    /// to Health (the user never sees the manual button in this path), then
+    /// clears for the next trip. Runs on the main run loop (timer callback).
+    func finishTripAndReset() {
+        pauseTrip()
+        if let record = makeRecord() { persistRecord?(record) }
+        // saveWorkout(from:) reads the trip's session data synchronously, so
+        // this must run before resetTrip() wipes it.
+        if hasSavableTrip { autoSaveHealth?() }
+        resetTrip()
     }
 
     var hasSavableTrip: Bool {
@@ -222,8 +261,7 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     private func scheduleAutoStop() {
         guard stopTimer == nil else { return }
         stopTimer = Timer.scheduledTimer(withTimeInterval: autoStopDelay, repeats: false) { [weak self] _ in
-            // Signal the view to save to history, then reset
-            self?.autoEndRequested = true
+            self?.finishTripAndReset()
         }
     }
 
@@ -257,7 +295,8 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
               location.horizontalAccuracy >= 0,
               location.horizontalAccuracy < 50 else { return }
 
-        if speedMetersPerSecond > maxSpeedMetersPerSecond {
+        if speedMetersPerSecond > maxSpeedMetersPerSecond,
+           speedMetersPerSecond <= maxPlausibleSpeed {
             maxSpeedMetersPerSecond = speedMetersPerSecond
         }
 
@@ -266,7 +305,13 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         if let last = lastLocation {
             let delta = location.distance(from: last)
             let dt = location.timestamp.timeIntervalSince(last.timestamp)
-            if delta >= minDelta, delta < 200, dt > 0 {
+            guard dt > 0 else { return }
+
+            if delta / dt > maxPlausibleSpeed {
+                // GPS jump: don't count it, but re-anchor so the fixes that
+                // follow aren't all measured against a stale position.
+                lastLocation = location
+            } else if delta >= minDelta {
                 tripDistanceMeters += delta
                 routeLocations.append(location)
                 lastLocation = location
@@ -413,7 +458,7 @@ struct SpeedView: View {
             }
             .pickerStyle(.segmented)
             .disabled(trip.isTracking)
-            .onChange(of: trip.activity) { trip.applyActivityTuning() }
+            .onChange(of: trip.activity) { _, _ in trip.applyActivityTuning() }
 
             Toggle(isOn: $trip.autoStart) {
                 Label("Auto Start", systemImage: "bolt.fill")
@@ -478,22 +523,20 @@ struct SpeedView: View {
             }
         }
         .padding()
-        .onChange(of: trip.autoEndRequested) { _, requested in
-            guard requested else { return }
-            saveToHistory()
-            trip.resetTrip()
-        }
         .alert("Saved to Apple Health",
-               isPresented: .constant(health.saveState == .saved)) {
+               isPresented: Binding(
+                   get: { health.saveState == .saved },
+                   set: { if !$0 { health.saveState = .idle } }
+               )) {
             Button("OK") { health.saveState = .idle }
         } message: {
             Text("Your \(trip.activity.rawValue.lowercased()) was saved as a workout with its route.")
         }
         .alert("Couldn't Save",
-               isPresented: .constant({
-                   if case .failed = health.saveState { return true }
-                   return false
-               }())) {
+               isPresented: Binding(
+                   get: { if case .failed = health.saveState { return true }; return false },
+                   set: { if !$0 { health.saveState = .idle } }
+               )) {
             Button("OK") { health.saveState = .idle }
         } message: {
             if case .failed(let msg) = health.saveState { Text(msg) }
@@ -546,15 +589,7 @@ struct SpeedView: View {
     }
 
     private func saveToHistory() {
-        guard trip.hasHistoryToSave else { return }
-        let record = TripRecord(
-            date: trip.sessionStart ?? Date(),
-            activity: trip.activity,
-            distanceMeters: trip.tripDistanceMeters,
-            durationSeconds: trip.elapsed,
-            maxSpeedMPS: trip.maxSpeedMetersPerSecond,
-            locations: trip.routeLocations
-        )
+        guard let record = trip.makeRecord() else { return }
         modelContext.insert(record)
     }
 
@@ -769,6 +804,7 @@ struct RootView: View {
     @StateObject private var trip = TripManager()
     @StateObject private var health = HealthManager()
     @AppStorage("useMPH") private var useMPH = true
+    @Environment(\.modelContext) private var modelContext
 
     var body: some View {
         TabView {
@@ -782,6 +818,11 @@ struct RootView: View {
                 .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
         }
         .onAppear {
+            trip.persistRecord = { modelContext.insert($0) }
+            trip.autoSaveHealth = { [weak trip, weak health] in
+                guard let trip, let health else { return }
+                health.saveWorkout(from: trip)
+            }
             trip.start()
             UIApplication.shared.isIdleTimerDisabled = true
         }
