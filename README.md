@@ -2,8 +2,9 @@
 
 A GPS speedometer and trip computer for iPhone, built with SwiftUI, CoreLocation, MapKit, and HealthKit. Mount your phone on the dash for a big, glanceable speed readout — or take it on a walk or bike ride and save the workout, route and all, to Apple Health.
 
-<!-- Add a screenshot: drag an image into this repo (e.g. docs/screenshot.png) and update the path below -->
-<!-- ![Speedometer screenshot](docs/screenshot.png) -->
+<p align="center">
+  <img src="Speedometer.jpeg" alt="Speedometer speed screen" width="300">
+</p>
 
 ## Features
 
