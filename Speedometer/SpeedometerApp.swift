@@ -1,9 +1,8 @@
 //
-//  SpeedometerApp.swift  (v3 — HealthKit)
-//  GPS speedometer / trip computer that can save walks and bike rides
-//  to Apple Health as workouts with route maps.
+//  SpeedometerApp.swift  (v4 — History)
+//  GPS speedometer / trip computer that saves history and Apple Health workouts.
 //
-//  New Xcode setup required for v3:
+//  Xcode setup required:
 //  1. Target > Signing & Capabilities > + Capability > HealthKit
 //  2. Target > Info > add:
 //     "Privacy - Health Update Usage Description"
@@ -13,6 +12,7 @@
 //
 
 import SwiftUI
+import SwiftData
 import CoreLocation
 import Combine
 import MapKit
@@ -41,7 +41,7 @@ enum ActivityType: String, CaseIterable, Identifiable {
         switch self {
         case .walk: .walking
         case .bike: .cycling
-        case .drive: .other   // never saved; placeholder
+        case .drive: .other
         }
     }
 
@@ -50,6 +50,38 @@ enum ActivityType: String, CaseIterable, Identifiable {
         case .bike: HKQuantityType(.distanceCycling)
         default:    HKQuantityType(.distanceWalkingRunning)
         }
+    }
+}
+
+// MARK: - Trip History Model
+
+@Model
+final class TripRecord {
+    var id: UUID
+    var date: Date
+    var activityRawValue: String
+    var distanceMeters: Double
+    var durationSeconds: Double
+    var maxSpeedMPS: Double
+    var encodedRoute: Data
+
+    init(date: Date, activity: ActivityType, distanceMeters: Double,
+         durationSeconds: Double, maxSpeedMPS: Double, locations: [CLLocation]) {
+        self.id = UUID()
+        self.date = date
+        self.activityRawValue = activity.rawValue
+        self.distanceMeters = distanceMeters
+        self.durationSeconds = durationSeconds
+        self.maxSpeedMPS = maxSpeedMPS
+        let pairs = locations.map { [$0.coordinate.latitude, $0.coordinate.longitude] }
+        self.encodedRoute = (try? JSONEncoder().encode(pairs)) ?? Data()
+    }
+
+    var activity: ActivityType { ActivityType(rawValue: activityRawValue) ?? .drive }
+
+    var routeCoordinates: [CLLocationCoordinate2D] {
+        guard let pairs = try? JSONDecoder().decode([[Double]].self, from: encodedRoute) else { return [] }
+        return pairs.map { CLLocationCoordinate2D(latitude: $0[0], longitude: $0[1]) }
     }
 }
 
@@ -66,17 +98,43 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     @Published var isTracking = false
     @Published var tripDistanceMeters: Double = 0
     @Published var maxSpeedMetersPerSecond: Double = 0
-    @Published var tripStart: Date? = nil               // start of current running segment
+    @Published var tripStart: Date? = nil
     @Published var accumulatedTime: TimeInterval = 0
-    @Published var routeLocations: [CLLocation] = []    // full fixes, needed for HealthKit routes
+    @Published var routeLocations: [CLLocation] = []
     @Published var activity: ActivityType = .drive
 
     // Session bookkeeping for HealthKit
-    @Published var sessionStart: Date? = nil            // first Start after a reset
-    @Published var sessionEnd: Date? = nil              // most recent Pause
+    @Published var sessionStart: Date? = nil
+    @Published var sessionEnd: Date? = nil
+    @Published var segments: [(start: Date, end: Date)] = []
+
+    // Auto start — resets to off each launch
+    @Published var autoStart: Bool = false
+    @Published var autoEndRequested: Bool = false
+    var isArmed: Bool { autoStart && !isTracking }
 
     private let manager = CLLocationManager()
     private var lastLocation: CLLocation? = nil
+    private var stopTimer: Timer? = nil
+
+    // Thresholds vary by activity (m/s)
+    private var autoStartThreshold: Double {
+        switch activity {
+        case .drive: return 2.2   // ~5 mph
+        case .bike:  return 3.6   // ~8 mph
+        case .walk:  return 0.7   // ~1.5 mph
+        }
+    }
+    private var autoStopThreshold: Double {
+        switch activity {
+        case .drive: return 1.0   // ~2.2 mph
+        case .bike:  return 2.2   // ~5 mph
+        case .walk:  return 0.4   // ~0.9 mph
+        }
+    }
+    private var autoStopDelay: TimeInterval {
+        activity == .drive ? 30 : 15
+    }
 
     var routeCoordinates: [CLLocationCoordinate2D] {
         routeLocations.map(\.coordinate)
@@ -95,7 +153,6 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         manager.startUpdatingLocation()
     }
 
-    /// Tune CoreLocation for the kind of movement expected.
     func applyActivityTuning() {
         manager.activityType = (activity == .drive) ? .automotiveNavigation : .fitness
     }
@@ -111,8 +168,11 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
 
     func pauseTrip() {
+        cancelAutoStop()
         if let start = tripStart {
-            accumulatedTime += Date().timeIntervalSince(start)
+            let now = Date()
+            accumulatedTime += now.timeIntervalSince(start)
+            segments.append((start: start, end: now))
         }
         tripStart = nil
         sessionEnd = Date()
@@ -120,6 +180,8 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
 
     func resetTrip() {
+        cancelAutoStop()
+        autoEndRequested = false
         pauseTrip()
         tripDistanceMeters = 0
         maxSpeedMetersPerSecond = 0
@@ -128,13 +190,13 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         lastLocation = nil
         sessionStart = nil
         sessionEnd = nil
+        segments.removeAll()
     }
 
     var elapsed: TimeInterval {
         accumulatedTime + (tripStart.map { Date().timeIntervalSince($0) } ?? 0)
     }
 
-    /// True when there is a completed (paused) trip worth saving.
     var hasSavableTrip: Bool {
         !isTracking
         && activity.savableToHealth
@@ -142,6 +204,10 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         && sessionStart != nil
         && sessionEnd != nil
         && routeLocations.count > 1
+    }
+
+    var hasHistoryToSave: Bool {
+        tripDistanceMeters > 10
     }
 
     // MARK: CLLocationManagerDelegate
@@ -153,12 +219,39 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
     }
 
+    private func scheduleAutoStop() {
+        guard stopTimer == nil else { return }
+        stopTimer = Timer.scheduledTimer(withTimeInterval: autoStopDelay, repeats: false) { [weak self] _ in
+            // Signal the view to save to history, then reset
+            self?.autoEndRequested = true
+        }
+    }
+
+    private func cancelAutoStop() {
+        stopTimer?.invalidate()
+        stopTimer = nil
+    }
+
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let location = locations.last else { return }
 
         accuracy = location.horizontalAccuracy
         let speed = location.speed
         speedMetersPerSecond = speed >= 0 ? speed : 0
+
+        // Auto start / auto pause logic
+        if autoStart {
+            if !isTracking, speedMetersPerSecond >= autoStartThreshold,
+               location.horizontalAccuracy >= 0, location.horizontalAccuracy < 50 {
+                startTrip()
+            } else if isTracking {
+                if speedMetersPerSecond < autoStopThreshold {
+                    scheduleAutoStop()
+                } else {
+                    cancelAutoStop()
+                }
+            }
+        }
 
         guard isTracking,
               location.horizontalAccuracy >= 0,
@@ -168,7 +261,6 @@ final class TripManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             maxSpeedMetersPerSecond = speedMetersPerSecond
         }
 
-        // Walks move slowly, so use a smaller jitter floor than driving.
         let minDelta: Double = (activity == .drive) ? 2 : 1
 
         if let last = lastLocation {
@@ -218,6 +310,7 @@ final class HealthManager: ObservableObject {
         let activity = trip.activity
         let distance = trip.tripDistanceMeters
         let locations = trip.routeLocations
+        let segments = trip.segments
 
         saveState = .saving
 
@@ -232,7 +325,6 @@ final class HealthManager: ObservableObject {
                     read: []
                 )
 
-                // Build the workout.
                 let config = HKWorkoutConfiguration()
                 config.activityType = activity.hkActivityType
                 config.locationType = .outdoor
@@ -242,6 +334,19 @@ final class HealthManager: ObservableObject {
                                                device: .local())
 
                 try await builder.beginCollection(at: start)
+
+                if segments.count > 1 {
+                    var events: [HKWorkoutEvent] = []
+                    for i in 0..<(segments.count - 1) {
+                        events.append(HKWorkoutEvent(type: .pause,
+                                                      dateInterval: DateInterval(start: segments[i].end, duration: 0),
+                                                      metadata: nil))
+                        events.append(HKWorkoutEvent(type: .resume,
+                                                      dateInterval: DateInterval(start: segments[i + 1].start, duration: 0),
+                                                      metadata: nil))
+                    }
+                    try await builder.addWorkoutEvents(events)
+                }
 
                 let distanceSample = HKQuantitySample(
                     type: distanceType,
@@ -257,7 +362,6 @@ final class HealthManager: ObservableObject {
                     return
                 }
 
-                // Attach the GPS route.
                 let routeBuilder = HKWorkoutRouteBuilder(healthStore: store, device: nil)
                 try await routeBuilder.insertRouteData(locations)
                 try await routeBuilder.finishRoute(with: workout, metadata: nil)
@@ -297,11 +401,11 @@ struct SpeedView: View {
     @ObservedObject var trip: TripManager
     @ObservedObject var health: HealthManager
     @Binding var useMPH: Bool
+    @Environment(\.modelContext) private var modelContext
 
     var body: some View {
         VStack(spacing: 14) {
 
-            // Activity picker — locked while tracking
             Picker("Activity", selection: $trip.activity) {
                 ForEach(ActivityType.allCases) { a in
                     Label(a.rawValue, systemImage: a.symbol).tag(a)
@@ -310,6 +414,12 @@ struct SpeedView: View {
             .pickerStyle(.segmented)
             .disabled(trip.isTracking)
             .onChange(of: trip.activity) { trip.applyActivityTuning() }
+
+            Toggle(isOn: $trip.autoStart) {
+                Label("Auto Start", systemImage: "bolt.fill")
+                    .font(.subheadline)
+            }
+            .disabled(trip.isTracking)
 
             Spacer()
 
@@ -348,7 +458,6 @@ struct SpeedView: View {
 
             controls
 
-            // Save to Health — appears only after a paused walk/bike trip
             if trip.hasSavableTrip {
                 saveToHealthButton
             }
@@ -369,6 +478,11 @@ struct SpeedView: View {
             }
         }
         .padding()
+        .onChange(of: trip.autoEndRequested) { _, requested in
+            guard requested else { return }
+            saveToHistory()
+            trip.resetTrip()
+        }
         .alert("Saved to Apple Health",
                isPresented: .constant(health.saveState == .saved)) {
             Button("OK") { health.saveState = .idle }
@@ -402,17 +516,25 @@ struct SpeedView: View {
 
     private var controls: some View {
         HStack(spacing: 16) {
-            Button {
-                trip.isTracking ? trip.pauseTrip() : trip.startTrip()
-            } label: {
-                Label(trip.isTracking ? "Pause" : "Start",
-                      systemImage: trip.isTracking ? "pause.fill" : "play.fill")
+            if trip.isArmed {
+                Label("Waiting for movement…", systemImage: "dot.radiowaves.left.and.right")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
+            } else {
+                Button {
+                    trip.isTracking ? trip.pauseTrip() : trip.startTrip()
+                } label: {
+                    Label(trip.isTracking ? "Pause" : "Start",
+                          systemImage: trip.isTracking ? "pause.fill" : "play.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(trip.isTracking ? .orange : .green)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(trip.isTracking ? .orange : .green)
 
             Button(role: .destructive) {
+                saveToHistory()
                 trip.resetTrip()
             } label: {
                 Label("Reset", systemImage: "arrow.counterclockwise")
@@ -421,6 +543,19 @@ struct SpeedView: View {
             .buttonStyle(.bordered)
         }
         .controlSize(.large)
+    }
+
+    private func saveToHistory() {
+        guard trip.hasHistoryToSave else { return }
+        let record = TripRecord(
+            date: trip.sessionStart ?? Date(),
+            activity: trip.activity,
+            distanceMeters: trip.tripDistanceMeters,
+            durationSeconds: trip.elapsed,
+            maxSpeedMPS: trip.maxSpeedMetersPerSecond,
+            locations: trip.routeLocations
+        )
+        modelContext.insert(record)
     }
 
     private func stat(_ label: String, _ value: String) -> some View {
@@ -481,6 +616,153 @@ struct TripMapView: View {
     }
 }
 
+// MARK: - History List Row
+
+struct TripRowView: View {
+    let record: TripRecord
+    let useMPH: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: record.activity.symbol)
+                .font(.title2)
+                .frame(width: 36)
+                .foregroundStyle(.blue)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(record.date.formatted(date: .abbreviated, time: .shortened))
+                    .font(.headline)
+                HStack(spacing: 12) {
+                    Label(Units.distanceString(record.distanceMeters, mph: useMPH),
+                          systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                    Label(Units.durationString(record.durationSeconds),
+                          systemImage: "clock")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Trip Detail View
+
+struct TripDetailView: View {
+    let record: TripRecord
+    let useMPH: Bool
+
+    private var routeRegion: MKCoordinateRegion {
+        let coords = record.routeCoordinates
+        guard !coords.isEmpty else { return MKCoordinateRegion() }
+        let lats = coords.map(\.latitude)
+        let lons = coords.map(\.longitude)
+        let minLat = lats.min()!, maxLat = lats.max()!
+        let minLon = lons.min()!, maxLon = lons.max()!
+        let center = CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2,
+                                            longitude: (minLon + maxLon) / 2)
+        let span = MKCoordinateSpan(latitudeDelta: (maxLat - minLat) * 1.5 + 0.005,
+                                    longitudeDelta: (maxLon - minLon) * 1.5 + 0.005)
+        return MKCoordinateRegion(center: center, span: span)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                if record.routeCoordinates.count > 1 {
+                    Map(initialPosition: .region(routeRegion)) {
+                        MapPolyline(coordinates: record.routeCoordinates)
+                            .stroke(.blue, style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+                        if let first = record.routeCoordinates.first {
+                            Marker("Start", systemImage: "flag.fill", coordinate: first)
+                                .tint(.green)
+                        }
+                        if let last = record.routeCoordinates.last {
+                            Marker("End", systemImage: "flag.checkered", coordinate: last)
+                                .tint(.red)
+                        }
+                    }
+                    .frame(height: 300)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .padding(.horizontal)
+                }
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                    statCard("Distance",
+                             Units.distanceString(record.distanceMeters, mph: useMPH),
+                             "point.topleft.down.to.point.bottomright.curvepath")
+                    statCard("Duration",
+                             Units.durationString(record.durationSeconds),
+                             "clock")
+                    statCard("Max Speed",
+                             String(format: "%.0f %@",
+                                    Units.speed(record.maxSpeedMPS, mph: useMPH),
+                                    useMPH ? "mph" : "km/h"),
+                             "speedometer")
+                    statCard("Activity",
+                             record.activity.rawValue,
+                             record.activity.symbol)
+                }
+                .padding(.horizontal)
+            }
+            .padding(.vertical)
+        }
+        .navigationTitle(record.date.formatted(date: .abbreviated, time: .shortened))
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func statCard(_ label: String, _ value: String, _ icon: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.title2)
+                .foregroundStyle(.blue)
+            Text(value)
+                .font(.headline)
+                .monospacedDigit()
+                .multilineTextAlignment(.center)
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding()
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+// MARK: - History Tab
+
+struct HistoryView: View {
+    @Query(sort: \TripRecord.date, order: .reverse) private var records: [TripRecord]
+    @Environment(\.modelContext) private var modelContext
+    let useMPH: Bool
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(records) { record in
+                    NavigationLink(destination: TripDetailView(record: record, useMPH: useMPH)) {
+                        TripRowView(record: record, useMPH: useMPH)
+                    }
+                }
+                .onDelete { indexSet in
+                    for i in indexSet { modelContext.delete(records[i]) }
+                }
+            }
+            .navigationTitle("History")
+            .overlay {
+                if records.isEmpty {
+                    ContentUnavailableView(
+                        "No Trips Yet",
+                        systemImage: "clock.arrow.circlepath",
+                        description: Text("Completed trips will appear here after you reset.")
+                    )
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Root View
 
 struct RootView: View {
@@ -495,6 +777,9 @@ struct RootView: View {
 
             TripMapView(trip: trip, useMPH: $useMPH)
                 .tabItem { Label("Map", systemImage: "map") }
+
+            HistoryView(useMPH: useMPH)
+                .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
         }
         .onAppear {
             trip.start()
@@ -514,5 +799,6 @@ struct SpeedometerApp: App {
         WindowGroup {
             RootView()
         }
+        .modelContainer(for: TripRecord.self)
     }
 }
